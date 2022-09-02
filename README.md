@@ -254,3 +254,5 @@ $ curl http://localhost:16686/api/metrics/minstep | jq .
   ]
 }
 ```
+
+Credits: [jaeger repository](https://github.com/jaegertracing/jaeger/tree/main/docker-compose/monitor)
