@@ -1,0 +1,46 @@
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: "0.0.0.0:4317"
+  jaeger:
+    protocols:
+      thrift_http:
+        endpoint: "0.0.0.0:4318"
+
+exporters:
+  prometheus:
+    endpoint: "0.0.0.0:8889"
+  jaeger:
+    endpoint: "jaeger:14250"
+    tls:
+      insecure: true
+  logging:
+    loglevel: debug
+  elasticsearch:
+    endpoints: [http://192.168.205.210:9200]
+    index: api-logs-generic
+
+processors:
+  batch:
+  spanmetrics:
+    metrics_exporter: prometheus
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [spanmetrics, batch]
+      exporters: [jaeger]
+    metrics/spanmetrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [prometheus]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [logging]
+    logs/2:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [elasticsearch]
