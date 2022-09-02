@@ -3,10 +3,6 @@ receivers:
     protocols:
       grpc:
         endpoint: "0.0.0.0:4317"
-  jaeger:
-    protocols:
-      thrift_http:
-        endpoint: "0.0.0.0:4318"
 
 exporters:
   prometheus:
@@ -18,7 +14,7 @@ exporters:
   logging:
     loglevel: debug
   elasticsearch:
-    endpoints: [http://192.168.205.210:9200]
+    endpoints: [http://elasticsearch:9200]
     index: api-logs-generic
 
 processors:

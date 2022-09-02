@@ -1,19 +1,21 @@
-# Service Performance Monitoring (SPM) Development/Demo Environment
+# AspNet Core: Tracing, Metrics (SPM), Logs Development/Demo Environment
 
 Service Performance Monitoring (SPM) is an opt-in feature introduced to Jaeger that provides Request, Error and Duration (RED) metrics grouped by service name and operation that are derived from span data. These metrics are programmatically available through an API exposed by jaeger-query along with a "Monitor" UI tab that visualizes these metrics as graphs. For more details on this feature, please refer to the [tracking Issue](https://github.com/jaegertracing/jaeger/issues/2954) documenting the proposal and status.
 
 The motivation for providing this environment is to allow developers to either test Jaeger UI or their own applications against jaeger-query's metrics query API, as well as a quick and simple way for users to bring up the entire stack required to visualize RED metrics from simulated traces (or their own).
 
-This environment consists four backend components:
-
-- [MicroSim](https://github.com/yurishkuro/microsim): a program to simulate traces.
-- [Jaeger All-in-one](https://www.jaegertracing.io/docs/1.24/getting-started/#all-in-one): the full Jaeger stack in a single container image.
+Environment Components:
 - [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/): vendor agnostic integration layer for traces and metrics. Its main role in this particular development environment is to receive Jaeger spans, forward these spans untouched to Jaeger All-in-one while simultaneously aggregating metrics out of this span data. To learn more about span metrics aggregation, please refer to the [spanmetrics processor documentation](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/processor/spanmetricsprocessor).
+- [Jaeger All-in-one](https://www.jaegertracing.io/docs/1.24/getting-started/#all-in-one): the full Jaeger stack in a single container image.
+- [Kibana](https://www.elastic.co/kibana/): a free and open user interface that lets you visualize your Elasticsearch data and navigate the Elastic Stack
+- [ElasticSearch](https://www.elastic.co/elasticsearch/): a distributed, RESTful search and analytics engine capable of addressing a growing number of use cases
 - [Prometheus](https://prometheus.io/): a metrics collection and query engine, used to scrape metrics computed by OpenTelemetry Collector, and presents an API for Jaeger All-in-one to query these metrics.
 
-The following diagram illustrates the relationship between these components:
-
-![SPM diagram](./diagram.png)
+Open ports:
+- Kibana (Logs): 5601
+- Jaeger UI (Tracing / SPM): 16686
+- Prometheus (Metrics): 9090
+- OTLP (GRPC Receiver): 4317
 
 # Getting Started
 
@@ -21,49 +23,105 @@ The following diagram illustrates the relationship between these components:
 
 ```bash
 docker-compose up
-docker-compose down
+docker-compose down --remove-orphans
 ```
 
-**Tip:** Let the application run for a couple of minutes to ensure there is enough time series data to plot in the dashboard. Navigate to Jaeger UI at http://localhost:16686/ and inspect the Monitor tab. Select `redis` service from the dropdown to see more than one endpoint.
+## Setup AspNetCore Project
 
-**Warning:** The included [docker-compose.yml](./docker-compose.yml) file uses the `latest` version of Jaeger and other components. If your local Docker registry already contains older versions, which may still be tagged as `latest`, you may want to delete those images before running the full set, to ensure consistent behavior:
-
-```bash
-docker rmi -f jaegertracing/all-in-one:latest
-docker rmi -f otel/opentelemetry-collector-contrib:latest
-docker rmi -f prom/prometheus:latest
+Nuget Packages (Preview):
+```
+OpenTelemetry.Extensions.Hosting
+OpenTelemetry.Instrumentation.AspNetCore
+OpenTelemetry.Instrumentation.EntityFrameworkCore
+OpenTelemetry.Instrumentation.Http
+OpenTelemetry.Exporter.OpenTelemetryProtocol
+OpenTelemetry.Exporter.OpenTelemetryProtocol.Logs
 ```
 
-## Example 1
-Fetch call rates for both the driver and frontend services, grouped by operation, from now,
-looking back 1 second with a sliding rate-calculation window of 1m and step size of 1 millisecond
-
-```bash
-curl "http://localhost:16686/api/metrics/calls?service=driver&service=frontend&groupByOperation=true&endTs=$(date +%s)000&lookback=1000&step=100&ratePer=60000" | jq .
+appsettings.json:
+```
+"OpenTelemetry": {
+  "ServiceName": "Microservice Name",
+  "ServiceNamespace": "Microservices",
+  "ServiceVersion": "1.0.0",
+  "Exporter": {
+    "Endpoint": "http://localhost:4317"
+  }
+}
 ```
 
+Program.cs / Startup.cs:
+```
+var otlpResourceBuilder = ResourceBuilder
+        .CreateDefault()
+        .AddService(
+            configuration.GetValue<string>("OpenTelemetry:ServiceName"),
+            configuration.GetValue<string>("OpenTelemetry:ServiceNamespace"),
+            configuration.GetValue<string>("OpenTelemetry:ServiceVersion"));
+var otlpExporterOptions = new Action<OtlpExporterOptions>(opt =>
+{
+    opt.Endpoint = new Uri(configuration.GetValue<string>("OpenTelemetry:Exporter:Endpoint"));
+    opt.Protocol = OtlpExportProtocol.Grpc;
+});
+services.AddOpenTelemetryTracing(t =>
+{
+    t
+    .AddSource(configuration.GetValue<string>("OpenTelemetry:ServiceName"))
+    .SetResourceBuilder(otlpResourceBuilder)
+    .AddAspNetCoreInstrumentation(o =>
+    {
+        o.Filter = (httpContext) => !httpContext.Request.Path.ToString().Contains("/_");
+        o.Enrich = (activity, eventName, rawObject) =>
+        {
+            if (eventName.Equals("OnStartActivity"))
+            {
+                if (rawObject is HttpRequest httpRequest)
+                {
+                    activity.SetStartTime(DateTime.Now);
+                    activity.SetTag("http.method", httpRequest.Method);
+                    activity.SetTag("http.url", httpRequest.Path);
+                }
+            }
+            else if (eventName.Equals("OnStopActivity"))
+            {
+                if (rawObject is HttpResponse httpResponse)
+                {
+                    activity.SetEndTime(DateTime.Now);
+                    activity.SetTag("responseLength", httpResponse.ContentLength);
+                }
+            }
+        };
+    })
+    .AddHttpClientInstrumentation(opt => opt.RecordException = true)
+    .AddEntityFrameworkCoreInstrumentation(o => o.SetDbStatementForText = true)
+    .AddOtlpExporter(otlpExporterOptions);
+});
 
-## Example 2
-Fetch P95 latencies for both the driver and frontend services from now,
-looking back 1 second with a sliding rate-calculation window of 1m and step size of 1 millisecond, where the span kind is either "server" or "client".
+services.AddOpenTelemetryMetrics(t =>
+{
+    t
+    .SetResourceBuilder(otlpResourceBuilder)
+    .AddAspNetCoreInstrumentation()
+    .AddOtlpExporter(otlpExporterOptions);
+});
 
-```bash
-curl "http://localhost:16686/api/metrics/latencies?service=driver&service=frontend&quantile=0.95&endTs=$(date +%s)000&lookback=1000&step=100&ratePer=60000&spanKind=server&spanKind=client" | jq .
+services.AddLogging(opt =>
+{
+    opt.AddOpenTelemetry(t =>
+    {
+        t
+        .SetResourceBuilder(otlpResourceBuilder)
+        .AddOtlpExporter(otlpExporterOptions);
+    });
+});
+
+services.AddSingleton(TracerProvider.Default.GetTracer(
+    configuration.GetValue<string>("OpenTelemetry:ServiceName")));
 ```
 
-## Example 3
-Fetch error rates for both driver and frontend services using default parameters.
-```bash
-curl "http://localhost:16686/api/metrics/errors?service=driver&service=frontend" | jq .
-```
+**Tip:** Let the application run for a couple of minutes to ensure there is enough time series data to plot in the dashboard. Navigate to Jaeger UI at http://localhost:16686/ and inspect the Monitor tab.
 
-## Example 4
-Fetch the minimum step size supported by the underlying metrics store.
-```bash
-curl "http://localhost:16686/api/metrics/minstep" | jq .
-```
-
-# HTTP API
+# Jaeger HTTP API
 
 ## Query Metrics
 
